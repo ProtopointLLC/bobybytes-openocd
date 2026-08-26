@@ -177,17 +177,72 @@ static int mips_m4k_poll(struct target *target)
 		return retval;
 	}
 
+	bool all_quirk = mips_ejtag_control_all_quirk(ejtag_info);
+
+	/*
+	 * MT7628AN: after a debugger-requested JTAGBRK, do not perform the
+	 * normal standalone CONTROL poll before debug_entry.  That scan
+	 * disturbs the first pending PRACC access.  The JTAGBRK request was
+	 * already issued by mips_m4k_halt(); let the fast queued PRACC engine
+	 * be the first consumer of the post-break EJTAG state.
+	 */
+	if (all_quirk && target->debug_reason == DBG_REASON_DBGRQ &&
+			target->state != TARGET_HALTED) {
+		LOG_DEBUG("mt7628 all-quirk: bypassing CONTROL poll after JTAGBRK");
+		LOG_DEBUG("mt7628 all-quirk: preserving JTAGBRK IR state until PRACC ALL select");
+
+		/* Do not select NORMALBOOT here on MT7628.  The known-good raw
+		 * sequence transitions directly from CONTROL/JTAGBRK to ALL. */
+		target->state = TARGET_HALTED;
+
+		retval = mips_m4k_debug_entry(target);
+		if (retval != ERROR_OK)
+			return retval;
+
+		target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+		return ERROR_OK;
+	}
+
+	/*
+	 * Once halted, avoid touching the standalone CONTROL register as
+	 * well. Resume/step changes target->state before running-state polling
+	 * is needed again.
+	 */
+	if (all_quirk && target->state == TARGET_HALTED)
+		return ERROR_OK;
+
+	/*
+	 * Mask ROCC out of the value about to be shifted *out*: on MT7628 the
+	 * readback is not trustworthy, so the reset-occurred handshake below
+	 * is skipped entirely and writing ROCC back would serve no purpose.
+	 */
+	if (all_quirk)
+		ejtag_ctrl &= ~EJTAG_CTRL_ROCC;
+
 	/* read ejtag control reg */
 	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_CONTROL);
 	retval = mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
 	if (retval != ERROR_OK)
 		return retval;
 
-	ejtag_info->isa = (ejtag_ctrl & EJTAG_CTRL_DBGISA) ? 1 : 0;
+	if (all_quirk) {
+		/*
+		 * On MT7628 the standalone CONTROL value is reliable enough for
+		 * BRKST, but its upper/status bits become corrupted in Debug
+		 * Mode.  In particular, do not use it for DBGISA or ROCC.
+		 *
+		 * Do not issue an EJTAG ALL scan here: ALL is a PRACC
+		 * transaction, not a passive state read, and would consume the
+		 * first pending fetch before mips32_pracc_queue_exec() sees it.
+		 */
+		ejtag_info->isa = 0;
+	} else {
+		ejtag_info->isa = (ejtag_ctrl & EJTAG_CTRL_DBGISA) ? 1 : 0;
+	}
 
 	/* clear this bit before handling polling
 	 * as after reset registers will read zero */
-	if (ejtag_ctrl & EJTAG_CTRL_ROCC) {
+	if (!all_quirk && (ejtag_ctrl & EJTAG_CTRL_ROCC)) {
 		/* we have detected a reset, clear flag
 		 * otherwise ejtag will not work */
 		ejtag_ctrl = ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC;

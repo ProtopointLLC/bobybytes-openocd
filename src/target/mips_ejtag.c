@@ -13,11 +13,26 @@
 #include "config.h"
 #endif
 
+#include <jtag/adapter.h>
+
 #include "mips32.h"
 #include "mips_ejtag.h"
 #include "mips32_dmaacc.h"
 #include "mips64.h"
 #include "mips64_pracc.h"
+
+
+/*
+ * MT7628AN quirk: standalone 32-bit EJTAG CONTROL/ADDRESS/DATA scans can
+ * return corrupted-looking values once Debug Mode has been entered, while
+ * the combined 96-bit EJTAG ALL scan remains coherent. Identify affected
+ * hardware via the EJTAG IDCODE so every other MIPS target keeps using the
+ * standalone scans unchanged.
+ */
+bool mips_ejtag_control_all_quirk(struct mips_ejtag *ejtag_info)
+{
+	return ejtag_info->all_quirk;
+}
 
 void mips_ejtag_set_instr(struct mips_ejtag *ejtag_info, uint32_t new_instr)
 {
@@ -66,16 +81,88 @@ void mips_ejtag_add_scan_96(struct mips_ejtag *ejtag_info, uint32_t ctrl, uint32
 	/* processor access "all" register 96 bit */
 	field.num_bits = 96;
 
-	field.out_value = out_scan;
-	buf_set_u32(out_scan, 0, 32, ctrl);
-	buf_set_u32(out_scan + 4, 0, 32, data);
-	buf_set_u32(out_scan + 8, 0, 32, 0);
-
-	field.in_value = in_scan_buf;
+	if (mips_ejtag_control_all_quirk(ejtag_info)) {
+		/*
+		 * Match jim_command_drscan() exactly for MT7628: use one
+		 * buffer for both TDI and TDO.  The interactive Tcl path is
+		 * the known-good reference for this target/J-Link pair.
+		 *
+		 * The caller consumes this buffer only after the scan has
+		 * executed, so overwriting the outgoing contents with the
+		 * captured response is intentional.
+		 */
+		buf_set_u32(in_scan_buf, 0, 32, ctrl);
+		buf_set_u32(in_scan_buf + 4, 0, 32, data);
+		buf_set_u32(in_scan_buf + 8, 0, 32, 0);
+		field.out_value = in_scan_buf;
+		field.in_value = in_scan_buf;
+	} else {
+		field.out_value = out_scan;
+		buf_set_u32(out_scan, 0, 32, ctrl);
+		buf_set_u32(out_scan + 4, 0, 32, data);
+		buf_set_u32(out_scan + 8, 0, 32, 0);
+		field.in_value = in_scan_buf;
+	}
 
 	jtag_add_dr_scan(tap, 1, &field, TAP_IDLE);
 
 	keep_alive();
+}
+
+int mips_ejtag_drscan_96(struct mips_ejtag *ejtag_info,
+		uint32_t ctrl_out, uint32_t data_out,
+		uint32_t *ctrl_in, uint32_t *data_in, uint32_t *addr_in)
+{
+	uint8_t in_scan[12];
+
+	/*
+	 * Flush the IR scan that selects EJTAG ALL as its own transaction
+	 * before queuing the 96-bit DR scan. The known-good manual recovery
+	 * recipe for this quirk issues "irscan ... 0x0b" and "drscan ... 96 0"
+	 * as two separate interactive commands, each its own round trip to
+	 * the adapter; batching the IR-select and DR-scan into a single
+	 * jtag_execute_queue() call (as mips_ejtag_drscan_32() does for the
+	 * other EJTAG registers) reproduces the same corrupted readback as
+	 * the standalone CONTROL scan this function exists to replace.
+	 */
+	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_ALL);
+	int retval = jtag_execute_queue();
+	if (retval != ERROR_OK) {
+		LOG_ERROR("EJTAG ALL instruction select failed");
+		return retval;
+	}
+
+	/*
+	 * Give the target time to settle onto the ALL shift register before
+	 * it is sampled. Every other EJTAG ALL consumer in this codebase
+	 * (the fast queued PRACC engine in mips32_pracc.c) inserts the same
+	 * scan_delay-derived idle clocks ahead of each 96-bit scan.
+	 */
+	unsigned num_clocks =
+		((uint64_t)(ejtag_info->scan_delay) * adapter_get_speed_khz() + 500000) / 1000000;
+	if (num_clocks)
+		jtag_add_clocks(num_clocks);
+
+	mips_ejtag_add_scan_96(ejtag_info, ctrl_out, data_out, in_scan);
+
+	retval = jtag_execute_queue();
+	if (retval != ERROR_OK) {
+		LOG_ERROR("EJTAG ALL register read failed");
+		return retval;
+	}
+
+	if (ctrl_in)
+		*ctrl_in = buf_get_u32(in_scan, 0, 32);
+	if (data_in)
+		*data_in = buf_get_u32(in_scan + 4, 0, 32);
+	if (addr_in)
+		*addr_in = buf_get_u32(in_scan + 8, 0, 32);
+
+	LOG_DEBUG("EJTAG ALL: ctrl=0x%8.8" PRIx32 " data=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32,
+			buf_get_u32(in_scan, 0, 32), buf_get_u32(in_scan + 4, 0, 32),
+			buf_get_u32(in_scan + 8, 0, 32));
+
+	return ERROR_OK;
 }
 
 int mips_ejtag_drscan_64(struct mips_ejtag *ejtag_info, uint64_t *data)
@@ -228,23 +315,77 @@ error:
 	return retval;
 }
 
+static int mt7628_force_control_ir(struct mips_ejtag *ejtag_info)
+{
+	struct scan_field field;
+	uint8_t ir_out[4] = { 0 };
+	int retval;
+
+	field.num_bits = ejtag_info->tap->ir_length;
+	field.out_value = ir_out;
+	field.in_value = NULL;
+
+	buf_set_u32(ir_out, 0, field.num_bits,
+			(1U << ejtag_info->tap->ir_length) - 1U);
+	jtag_add_ir_scan(ejtag_info->tap, &field, TAP_IDLE);
+	retval = jtag_execute_queue();
+	if (retval != ERROR_OK)
+		return retval;
+
+	buf_set_u32(ir_out, 0, field.num_bits, EJTAG_INST_CONTROL);
+	jtag_add_ir_scan(ejtag_info->tap, &field, TAP_IDLE);
+	retval = jtag_execute_queue();
+	if (retval != ERROR_OK)
+		return retval;
+
+	LOG_DEBUG("mt7628 all-quirk: physically forced BYPASS -> CONTROL");
+	return ERROR_OK;
+}
+
 int mips_ejtag_enter_debug(struct mips_ejtag *ejtag_info)
 {
 	uint32_t ejtag_ctrl;
-	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_CONTROL);
+	int retval;
+
+	bool all_quirk = mips_ejtag_control_all_quirk(ejtag_info);
+	if (all_quirk) {
+		retval = mt7628_force_control_ir(ejtag_info);
+		if (retval != ERROR_OK)
+			goto error;
+	} else {
+		mips_ejtag_set_instr(ejtag_info, EJTAG_INST_CONTROL);
+	}
 
 	if (ejtag_info->ejtag_version == EJTAG_VERSION_20) {
 		if (disable_dcr_mp(ejtag_info) != ERROR_OK)
 			goto error;
 	}
 
+	LOG_DEBUG("mt7628 all-quirk: %s (tap idcode: 0x%8.8" PRIx32 ")",
+			all_quirk ? "active" : "inactive",
+			ejtag_info->tap ? ejtag_info->tap->idcode : 0);
+
 	/* set debug break bit */
 	ejtag_ctrl = ejtag_info->ejtag_ctrl | EJTAG_CTRL_JTAGBRK;
-	mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
+	if (all_quirk)
+		ejtag_ctrl &= ~(EJTAG_CTRL_PRACC | EJTAG_CTRL_ROCC);
+
+	LOG_DEBUG("JTAGBRK control write: 0x%8.8" PRIx32, ejtag_ctrl);
+	retval = mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
+	if (retval != ERROR_OK)
+		goto error;
 
 	/* break bit will be cleared by hardware */
 	ejtag_ctrl = ejtag_info->ejtag_ctrl;
-	mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
+	if (all_quirk) {
+		LOG_DEBUG("mt7628 all-quirk: skipping post-JTAGBRK CONTROL/ALL read");
+		return ERROR_OK;
+	}
+
+	retval = mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
+	if (retval != ERROR_OK)
+		goto error;
+
 	LOG_DEBUG("ejtag_ctrl: 0x%8.8" PRIx32 "", ejtag_ctrl);
 	if ((ejtag_ctrl & EJTAG_CTRL_BRKST) == 0)
 		goto error;

@@ -185,6 +185,9 @@
 #define EJTAG64_V25_IBA0		0xFFFFFFFFFF301100ull
 #define EJTAG64_V25_IBS			0xFFFFFFFFFF301000ull
 
+/* TAP IDCODE of the part the all-quirk workaround was written against. */
+#define MT7628_EJTAG_IDCODE 0x1762824fU
+
 struct mips_ejtag {
 	struct jtag_tap *tap;
 	uint32_t impcode;
@@ -198,6 +201,15 @@ struct mips_ejtag {
 	uint32_t reg9;
 	unsigned scan_delay;
 	int mode;
+
+	/*
+	 * Opt-in workaround for EJTAG TAPs whose standalone CONTROL / ADDRESS /
+	 * DATA registers corrupt TAP state when selected individually in Debug
+	 * Mode (observed on MT7628AN).  Off by default: it changes every
+	 * halted-mode transaction and disables FASTDATA, so it must never be
+	 * enabled implicitly.  Set with "mips32 ejtag_all_quirk on".
+	 */
+	bool all_quirk;
 	uint32_t pa_ctrl;
 	uint32_t pa_addr;
 	unsigned int ejtag_version;
@@ -231,6 +243,10 @@ int mips64_ejtag_exit_debug(struct mips_ejtag *ejtag_info);
 int mips_ejtag_get_idcode(struct mips_ejtag *ejtag_info);
 void mips_ejtag_add_scan_96(struct mips_ejtag *ejtag_info,
 			    uint32_t ctrl, uint32_t data, uint8_t *in_scan_buf);
+int mips_ejtag_drscan_96(struct mips_ejtag *ejtag_info,
+			    uint32_t ctrl_out, uint32_t data_out,
+			    uint32_t *ctrl_in, uint32_t *data_in, uint32_t *addr_in);
+bool mips_ejtag_control_all_quirk(struct mips_ejtag *ejtag_info);
 int mips_ejtag_drscan_64(struct mips_ejtag *ejtag_info, uint64_t *data);
 void mips_ejtag_drscan_32_out(struct mips_ejtag *ejtag_info, uint32_t data);
 int mips_ejtag_drscan_32(struct mips_ejtag *ejtag_info, uint32_t *data);

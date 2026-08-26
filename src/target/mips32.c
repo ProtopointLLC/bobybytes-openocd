@@ -987,6 +987,40 @@ COMMAND_HANDLER(mips32_handle_scan_delay_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(mips32_handle_ejtag_all_quirk_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct mips32_common *mips32 = target_to_mips32(target);
+	struct mips_ejtag *ejtag_info = &mips32->ejtag_info;
+
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC == 1) {
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], ejtag_info->all_quirk);
+
+		/*
+		 * Only warn: the check needs an examined TAP, and this command
+		 * is normally issued from a config file before examine.  A user
+		 * enabling it on another part with the same defect is doing
+		 * something reasonable.
+		 */
+		if (ejtag_info->all_quirk && target_was_examined(target) &&
+				ejtag_info->tap &&
+				ejtag_info->tap->idcode != MT7628_EJTAG_IDCODE)
+			LOG_WARNING("ejtag_all_quirk enabled on IDCODE 0x%8.8" PRIx32
+					", but it was written for 0x%8.8" PRIx32,
+					ejtag_info->tap->idcode, MT7628_EJTAG_IDCODE);
+	}
+
+	command_print(CMD, "ejtag all-register quirk: %s",
+			ejtag_info->all_quirk ? "on" : "off");
+	if (ejtag_info->all_quirk)
+		command_print(CMD, "  halted-mode access via 96-bit ALL register; FASTDATA disabled");
+
+	return ERROR_OK;
+}
+
 static const struct command_registration mips32_exec_command_handlers[] = {
 	{
 		.name = "cp0",
@@ -1001,6 +1035,16 @@ static const struct command_registration mips32_exec_command_handlers[] = {
 		.mode = COMMAND_ANY,
 		.help = "display/set scan delay in nano seconds",
 		.usage = "[value]",
+	},
+	{
+		.name = "ejtag_all_quirk",
+		.handler = mips32_handle_ejtag_all_quirk_command,
+		.mode = COMMAND_ANY,
+		.help = "Route halted-mode EJTAG access through the 96-bit ALL "
+			"register, for TAPs whose standalone CONTROL/ADDRESS/DATA "
+			"selects corrupt state in Debug Mode (MT7628AN). Disables "
+			"FASTDATA. Off by default.",
+		.usage = "['on'|'off']",
 	},
 	COMMAND_REGISTRATION_DONE
 };
