@@ -523,6 +523,44 @@ static int mt7628_pracc_exec_one(struct mips_ejtag *ejtag_info,
 	return ERROR_OK;
 }
 
+/*
+ * Walk the core back to PRACC_TEXT.
+ *
+ * There is no memory behind dmseg: the core executes whatever the probe hands
+ * it, one instruction per processor access, and its PC only ever advances.  A
+ * core that has drifted off PRACC_TEXT therefore cannot return on its own -
+ * the probe has to feed it a branch.  Stock OpenOCD does this in
+ * mips32_pracc_clean_text_jump(); the MT7628 executor needs the same thing,
+ * with the mandatory interlock scan after every supplied instruction.
+ *
+ * Three NOPs drain the pipeline before the branch, matching stock.  The
+ * interlock scan that follows each supplied instruction provides the branch
+ * delay slot, so nothing extra is needed for it.
+ *
+ * @param pc address of the pending fetch, i.e. where the core will execute the
+ *           first NOP of this sequence.
+ */
+static int mt7628_pracc_jump_to_text(struct mips_ejtag *ejtag_info,
+		uint32_t service_ctrl, uint32_t pc)
+{
+	LOG_DEBUG("mt7628 PRACC: steering core from 0x%8.8" PRIx32
+			" back to PRACC_TEXT", pc);
+
+	for (unsigned int i = 0; i < 3; i++) {
+		int retval = mt7628_pracc_exec_one(ejtag_info, service_ctrl,
+				MIPS32_NOP, pc, 0, NULL);
+		if (retval != ERROR_OK)
+			return retval;
+
+		/* Each supplied instruction costs two fetch slots: the
+		 * instruction itself and the interlock NOP after it. */
+		pc += 8;
+	}
+
+	return mt7628_pracc_exec_one(ejtag_info, service_ctrl,
+			mt7628_rewrite_b_to_text(pc), pc, 0, NULL);
+}
+
 static int mt7628_pracc_exec(struct mips_ejtag *ejtag_info,
 		struct pracc_queue_info *ctx, uint32_t *buf, bool check_last)
 {
@@ -552,6 +590,7 @@ static int mt7628_pracc_exec(struct mips_ejtag *ejtag_info,
 	uint32_t data;
 	uint32_t addr;
 	bool prime_ok = false;
+	unsigned int jump_count = 0;
 	for (unsigned int attempt = 0; attempt < 32; attempt++) {
 		ctrl = 0;
 		data = 0;
@@ -593,6 +632,35 @@ static int mt7628_pracc_exec(struct mips_ejtag *ejtag_info,
 		 */
 		if (!(ctrl & EJTAG_CTRL_PRACC) && addr == 0)
 			continue;
+
+		/*
+		 * A live fetch somewhere else in the dmseg code area.  The core
+		 * is in Debug Mode but its PC has drifted off PRACC_TEXT - for
+		 * example because a reset re-entered at the debug exception
+		 * vector while a program was mid-flight, or because an earlier
+		 * transfer was aborted.  Steer it back rather than failing.
+		 *
+		 * The scan above already completed the fetch at addr with a
+		 * NOP, so the core is now pending at addr + 4.
+		 */
+		if ((ctrl & EJTAG_CTRL_PRACC) &&
+				!(ctrl & EJTAG_CTRL_PRNW) &&
+				addr >= MIPS32_PRACC_TEXT &&
+				addr < MIPS32_PRACC_PARAM_OUT) {
+			if (jump_count >= 3) {
+				LOG_ERROR("mt7628 PRACC entry: core still off "
+						"PRACC_TEXT after %u jumps, last fetch 0x%8.8" PRIx32,
+						jump_count, addr);
+				return ERROR_FAIL;
+			}
+			jump_count++;
+
+			retval = mt7628_pracc_jump_to_text(ejtag_info,
+					service_ctrl, addr + 4);
+			if (retval != ERROR_OK)
+				return retval;
+			continue;
+		}
 
 		/*
 		 * Do not silently consume an unexpected live processor access.
