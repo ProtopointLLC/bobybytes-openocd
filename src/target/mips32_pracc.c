@@ -1531,16 +1531,24 @@ static int mt7628_fastdata_wait(struct mips_ejtag *ejtag_info)
 	if (retval != ERROR_OK)
 		return retval;
 
-	retval = mt7628_pracc_force_all_ir(ejtag_info);
-	if (retval != ERROR_OK)
-		return retval;
-
 	uint32_t observe_ctrl =
 			(ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC) | EJTAG_CTRL_PRACC;
 	int64_t then = timeval_ms();
+	unsigned int poll = 0;
 
 	while (1) {
 		uint32_t ctrl = 0, daddr = 0;
+
+		/*
+		 * Re-force ALL before every read.  This TAP does not stay on
+		 * the selected instruction, and the drift is not always the
+		 * clean IDCODE that mt7628_pracc_prime_at_text() looks for -
+		 * a FASTDATA scan leaves it answering 0xffff824f/0xffffffff,
+		 * the corrupted-upper-half form of IDCODE.
+		 */
+		retval = mt7628_pracc_force_all_ir(ejtag_info);
+		if (retval != ERROR_OK)
+			return retval;
 
 		retval = mt7628_pracc_all_scan(ejtag_info, observe_ctrl, 0,
 				&ctrl, NULL, &daddr);
@@ -1550,6 +1558,9 @@ static int mt7628_fastdata_wait(struct mips_ejtag *ejtag_info)
 		if ((ctrl & EJTAG_CTRL_PRACC) &&
 				daddr == MIPS32_PRACC_FASTDATA_AREA)
 			break;
+
+		LOG_DEBUG("mt7628 fastdata wait[%u]: ctrl=0x%8.8" PRIx32
+				" addr=0x%8.8" PRIx32, poll++, ctrl, daddr);
 
 		if (timeval_ms() - then > 1000) {
 			LOG_ERROR("mt7628 fastdata: no access pending at FASTDATA_AREA "
