@@ -246,12 +246,24 @@ static int mips_m4k_poll(struct target *target)
 		/* we have detected a reset, clear flag
 		 * otherwise ejtag will not work */
 		ejtag_ctrl = ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC;
+		uint32_t rocc_wrote = ejtag_ctrl;
 
 		mips_ejtag_set_instr(ejtag_info, EJTAG_INST_CONTROL);
 		retval = mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
 		if (retval != ERROR_OK)
 			return retval;
-		LOG_DEBUG("Reset Detected");
+
+		/* Did the Rocc=0 write actually land?  Re-read as its own scan. */
+		uint32_t rocc_after = ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC;
+		retval = mips_ejtag_drscan_32(ejtag_info, &rocc_after);
+		if (retval != ERROR_OK)
+			return retval;
+
+		LOG_DEBUG("Reset Detected: wrote 0x%8.8" PRIx32
+				", capture 0x%8.8" PRIx32
+				", re-read 0x%8.8" PRIx32 " -> Rocc %s",
+				rocc_wrote, ejtag_ctrl, rocc_after,
+				(rocc_after & EJTAG_CTRL_ROCC) ? "STILL SET" : "cleared");
 	}
 
 	/* check for processor halted */

@@ -39,18 +39,29 @@ void mips_ejtag_set_instr(struct mips_ejtag *ejtag_info, uint32_t new_instr)
 	assert(ejtag_info->tap);
 	struct jtag_tap *tap = ejtag_info->tap;
 
-	if (buf_get_u32(tap->cur_instr, 0, tap->ir_length) != new_instr) {
+	if (ejtag_info->ir_resync == 0 &&
+			buf_get_u32(tap->cur_instr, 0, tap->ir_length) == new_instr)
+		return;
 
-		struct scan_field field;
-		field.num_bits = tap->ir_length;
+	struct scan_field field;
+	field.num_bits = tap->ir_length;
 
-		uint8_t t[4] = { 0 };
-		field.out_value = t;
-		buf_set_u32(t, 0, field.num_bits, new_instr);
+	uint8_t t[4] = { 0 };
+	field.out_value = t;
+	buf_set_u32(t, 0, field.num_bits, new_instr);
 
-		field.in_value = NULL;
+	field.in_value = NULL;
 
-		jtag_add_ir_scan(tap, &field, TAP_IDLE);
+	jtag_add_ir_scan(tap, &field, TAP_IDLE);
+
+	/*
+	 * Level 2 additionally flushes the select on its own, so the IR scan
+	 * and the DR scan that follows are separate adapter transactions.
+	 */
+	if (ejtag_info->ir_resync >= 2) {
+		int retval = jtag_execute_queue();
+		if (retval != ERROR_OK)
+			LOG_ERROR("IR resync flush failed");
 	}
 }
 

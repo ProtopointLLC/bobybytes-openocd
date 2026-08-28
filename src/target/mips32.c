@@ -376,6 +376,7 @@ int mips32_init_arch_info(struct target *target, struct mips32_common *mips32, s
 	/* if unknown endianness defaults to little endian, 1 */
 	mips32->ejtag_info.endianness = target->endianness == TARGET_BIG_ENDIAN ? 0 : 1;
 	mips32->ejtag_info.scan_delay = MIPS32_SCAN_DELAY_LEGACY_MODE;
+	mips32->ejtag_info.allow_fastdata = true;
 	mips32->ejtag_info.mode = 0;			/* Initial default value */
 	mips32->ejtag_info.isa = 0;	/* isa on debug mips32, updated by poll function */
 	mips32->ejtag_info.config_regs = 0;	/* no config register read */
@@ -1021,6 +1022,51 @@ COMMAND_HANDLER(mips32_handle_ejtag_all_quirk_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(mips32_handle_ejtag_ir_resync_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct mips32_common *mips32 = target_to_mips32(target);
+	struct mips_ejtag *ejtag_info = &mips32->ejtag_info;
+
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC == 1) {
+		unsigned int level;
+		COMMAND_PARSE_NUMBER(uint, CMD_ARGV[0], level);
+		if (level > 2) {
+			command_print(CMD, "level must be 0, 1 or 2");
+			return ERROR_COMMAND_ARGUMENT_INVALID;
+		}
+		ejtag_info->ir_resync = level;
+	}
+
+	static const char * const desc[] = {
+		"0 - stock, trust tap->cur_instr",
+		"1 - always emit the IR scan",
+		"2 - always emit the IR scan, flushed as its own transaction",
+	};
+	command_print(CMD, "ejtag IR resync: %s", desc[ejtag_info->ir_resync]);
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(mips32_handle_ejtag_allow_fastdata_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct mips32_common *mips32 = target_to_mips32(target);
+	struct mips_ejtag *ejtag_info = &mips32->ejtag_info;
+
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], ejtag_info->allow_fastdata);
+
+	command_print(CMD, "ejtag FASTDATA under all_quirk: %s",
+			ejtag_info->allow_fastdata ? "allowed" : "refused");
+	return ERROR_OK;
+}
+
 static const struct command_registration mips32_exec_command_handlers[] = {
 	{
 		.name = "cp0",
@@ -1045,6 +1091,26 @@ static const struct command_registration mips32_exec_command_handlers[] = {
 			"selects corrupt state in Debug Mode (MT7628AN). Disables "
 			"FASTDATA. Off by default.",
 		.usage = "['on'|'off']",
+	},
+	{
+		.name = "ejtag_allow_fastdata",
+		.handler = mips32_handle_ejtag_allow_fastdata_command,
+		.mode = COMMAND_ANY,
+		.help = "Allow FASTDATA bulk writes while ejtag_all_quirk is on, "
+			"via the ALL-register handshake. On by default; turn off to "
+			"fall back to PRACC writes.",
+		.usage = "['on'|'off']",
+	},
+	{
+		.name = "ejtag_ir_resync",
+		.handler = mips32_handle_ejtag_ir_resync_command,
+		.mode = COMMAND_ANY,
+		.help = "Re-select the EJTAG instruction register on every access "
+			"instead of trusting OpenOCD's cached tap->cur_instr, for "
+			"TAPs that do not stay on the last selected instruction. "
+			"0 = stock, 1 = always re-select, 2 = also flush the select "
+			"as its own transaction.",
+		.usage = "['0'|'1'|'2']",
 	},
 	COMMAND_REGISTRATION_DONE
 };

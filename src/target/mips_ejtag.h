@@ -210,6 +210,29 @@ struct mips_ejtag {
 	 * enabled implicitly.  Set with "mips32 ejtag_all_quirk on".
 	 */
 	bool all_quirk;
+
+	/*
+	 * IR-select resynchronisation, for TAPs that do not stay on the
+	 * instruction OpenOCD last selected.  mips_ejtag_set_instr() normally
+	 * skips the IR scan when tap->cur_instr already matches; if the TAP has
+	 * meanwhile reverted, every later DR scan then reads the wrong register.
+	 *
+	 *   0  stock - trust tap->cur_instr
+	 *   1  always emit the IR scan
+	 *   2  always emit it and flush it as its own adapter transaction
+	 *
+	 * Set with "mips32 ejtag_ir_resync".
+	 */
+	unsigned int ir_resync;
+
+	/*
+	 * FASTDATA under all_quirk, using the ALL-register handshake in
+	 * mt7628_fastdata_enter_handler().  Enabled by default - measured at
+	 * ~73 KiB/s against ~2 KiB/s for the PRACC fallback, verified clean.
+	 * Kept as an escape hatch: "mips32 ejtag_allow_fastdata off" falls back
+	 * to PRACC writes.
+	 */
+	bool allow_fastdata;
 	uint32_t pa_ctrl;
 	uint32_t pa_addr;
 	unsigned int ejtag_version;
