@@ -1514,71 +1514,62 @@ static int mips32_fastdata_enter_handler(struct mips_ejtag *ejtag_info,
 /*
  * Feed the FASTDATA handler through the ALL register.
  *
- * The FASTDATA register does not service processor accesses on this part:
- * a properly isolated 33-bit FASTDATA scan leaves the handler's read still
- * pending at FASTDATA_AREA, and leaves the TAP answering with the corrupted
- * upper-half form of IDCODE.  The ALL register does service them - that is
- * what the old drain loop was unwittingly doing when it fed the handler three
- * zeros - so the data goes that way instead.
+ * The FASTDATA register does not service processor accesses on this part: a
+ * properly isolated 33-bit FASTDATA scan leaves the handler's read still
+ * pending at FASTDATA_AREA.  The ALL register does service them - that is what
+ * the old drain loop was doing when it fed the handler three zeros - so the
+ * payload goes that way instead.
  *
- * The handler asks for exactly count + 2 words: the start address, the end
- * address, then one per element.  Each ALL scan reports the access it is about
- * to service, so every word is verified for free: if the pending access is not
- * a read at FASTDATA_AREA the handler has lost sync and the transfer stops
- * rather than scattering words into memory.
+ * One scan per word, and no checking of what comes back.  The handler runs
+ * from the work area rather than dmseg, so each loop iteration raises exactly
+ * one access (the lw) and there is no second transaction for an interlock to
+ * absorb.  The scan immediately after a service reads back the corrupted
+ * upper-half form - 0xffffc008 where CONTROL holds 0x4004c008 - while the
+ * service itself lands, so validating per word rejects good transfers.  Worse,
+ * retrying on it would service the *next* access with a duplicate word.
+ *
+ * Only the first scan is checked, to confirm the handler is really parked on
+ * its first read before the stream starts.  Correctness of the payload is
+ * established afterwards: the caller checks the handler retired to PRACC_TEXT,
+ * and boot_uboot_jtag.py CRC32s the image in DRAM.
  */
 static int mt7628_fastdata_all_xfer(struct mips_ejtag *ejtag_info,
 		uint32_t addr, int count, uint32_t *buf)
 {
 	uint32_t service_ctrl =
 			ejtag_info->ejtag_ctrl & ~(EJTAG_CTRL_PRACC | EJTAG_CTRL_ROCC);
+	uint32_t ctrl = 0, daddr = 0;
 
 	int retval = mt7628_pracc_force_all_ir(ejtag_info);
 	if (retval != ERROR_OK)
 		return retval;
 
-	for (int i = 0; i < count + 2; i++) {
-		uint32_t word;
+	/* Word 0: the start address, and the one readback worth trusting. */
+	retval = mt7628_pracc_all_scan(ejtag_info, service_ctrl, addr,
+			&ctrl, NULL, &daddr);
+	if (retval != ERROR_OK)
+		return retval;
 
-		if (i == 0)
-			word = addr;
-		else if (i == 1)
-			word = addr + (count - 1) * 4;
-		else
-			word = buf[i - 2];
+	if (!(ctrl & EJTAG_CTRL_PRACC) || daddr != MIPS32_PRACC_FASTDATA_AREA) {
+		LOG_ERROR("mt7628 fastdata: handler not waiting at FASTDATA_AREA "
+				"(ctrl=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32 ")",
+				ctrl, daddr);
+		return ERROR_FAIL;
+	}
 
-		uint32_t ctrl = 0, daddr = 0;
+	/* Word 1: the end address, then one word per element. */
+	uint32_t last = addr + (count - 1) * 4;
 
-		retval = mt7628_pracc_all_scan(ejtag_info, service_ctrl, word,
-				&ctrl, NULL, &daddr);
+	retval = mt7628_pracc_all_scan(ejtag_info, service_ctrl, last,
+			NULL, NULL, NULL);
+	if (retval != ERROR_OK)
+		return retval;
+
+	for (int i = 0; i < count; i++) {
+		retval = mt7628_pracc_all_scan(ejtag_info, service_ctrl, buf[i],
+				NULL, NULL, NULL);
 		if (retval != ERROR_OK)
 			return retval;
-
-		if (!(ctrl & EJTAG_CTRL_PRACC) ||
-				daddr != MIPS32_PRACC_FASTDATA_AREA) {
-			/*
-			 * Either the TAP drifted off ALL or the handler is not
-			 * where it should be.  Re-force and retry once; the
-			 * drift is not always the clean idcode value that
-			 * mt7628_pracc_prime_at_text() recognises.
-			 */
-			retval = mt7628_pracc_force_all_ir(ejtag_info);
-			if (retval != ERROR_OK)
-				return retval;
-
-			retval = mt7628_pracc_all_scan(ejtag_info, service_ctrl,
-					word, &ctrl, NULL, &daddr);
-			if (retval != ERROR_OK)
-				return retval;
-
-			if (!(ctrl & EJTAG_CTRL_PRACC) ||
-					daddr != MIPS32_PRACC_FASTDATA_AREA) {
-				LOG_ERROR("mt7628 fastdata: lost sync at word %d of %d "
-						"(ctrl=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32 ")",
-						i, count + 2, ctrl, daddr);
-				return ERROR_FAIL;
-			}
-		}
 
 		keep_alive();
 	}
