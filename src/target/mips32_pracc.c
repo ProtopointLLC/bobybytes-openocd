@@ -572,18 +572,12 @@ static int mt7628_pracc_exec_one(struct mips_ejtag *ejtag_info,
 /*
  * Walk the core out of dmseg and into the FASTDATA write handler in DRAM.
  *
- * This is the MT7628 replacement for the jump-code loop in
- * mips32_pracc_fastdata_xfer(), which drives wait_for_pracc_rw() and
- * mips32_pracc_finish() - i.e. the standalone CONTROL register, which does not
- * read correctly on this part.  Measured symptom of the stock loop: the core
- * never leaves PRACC_TEXT, and the handshake reports
+ * Replaces the stock jump-code loop, which drives the standalone CONTROL
+ * register and so cannot complete an access on this part.
  *
- *   pa_addr=0xff200204 expected 0xff200000 pa_ctrl=0xffffc008
- *
- * Only three instructions are fed.  The mandatory interlock services each
- * following sequential fetch with a NOP, and for JR that NOP *is* the branch
- * delay slot - so the fourth instruction of the stock jump code (an explicit
- * delay-slot NOP) must not be sent, or it would be fetched from the handler.
+ * Three instructions, not four: the interlock services each following
+ * sequential fetch with a NOP, and for JR that NOP is the branch delay slot,
+ * so the stock explicit delay-slot NOP would be fetched from the handler.
  */
 static int mt7628_fastdata_enter_handler(struct mips_ejtag *ejtag_info,
 		uint32_t handler_addr)
@@ -1522,30 +1516,6 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 {
 	uint32_t isa = ejtag_info->isa ? 1 : 0;
 
-	/*
-	 * FASTDATA is not usable on MT7628 as reached by this driver.
-	 *
-	 * Selecting EJTAG_INST_FASTDATA does not take: the TAP answers with
-	 * IDCODE, so a 33-bit Fastdata scan shifts out IDCODE's mandatory LSB
-	 * as "SPrAcc" and IDCODE[31:1] as "DATA" -- 0x1762824f giving a
-	 * constant SPrAcc=1 and data=0x0bb14127.  No scan ever completes a
-	 * processor access, but every one reports success, so the resident
-	 * handler stalls forever on the same FASTDATA_AREA request while the
-	 * transfer appears to succeed and no data reaches DRAM.
-	 *
-	 * The IR machinery itself is sound: mt7628_pracc_force_all_ir() drives
-	 * every ALL scan (IR 0x0b) in the PRACC executor correctly, in the same
-	 * session.  Only the Fastdata select fails to stick.  Rather than ship
-	 * a path that silently discards data, refuse outright.
-	 *
-	 * Returning an error makes mips_m4k_bulk_write_memory() fall back to
-	 * the PRACC write path, which is slow but correct on this target.
-	 */
-	if (mips_ejtag_control_all_quirk(ejtag_info) && !ejtag_info->allow_fastdata) {
-		LOG_DEBUG("mt7628: FASTDATA disabled by ejtag_allow_fastdata, using PRACC writes");
-		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-	}
-
 	uint32_t handler_code[] = {
 		/* r15 points to the start of this code */
 		MIPS32_SW(isa, 8, MIPS32_FASTDATA_HANDLER_SIZE - 4, 15),
@@ -1615,12 +1585,11 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 
 	if (quirk) {
 		/*
-		 * Select FASTDATA the same way the ALL path selects everything
-		 * else: forced through BYPASS, flushed on its own.  Also note
-		 * mt7628_fastdata_enter_handler() cannot confirm the handler
-		 * reached FASTDATA_AREA the way the stock path does - an ALL
-		 * scan both reads and completes an access, so there is no
-		 * non-destructive peek.  The FASTDATA scans below service it.
+		 * Select FASTDATA the same way as everything else here: forced
+		 * through BYPASS, flushed on its own. Unlike the stock path
+		 * there is no confirming read that the handler reached
+		 * FASTDATA_AREA - an ALL scan would consume the access it is
+		 * checking for. The FASTDATA scans below service it.
 		 */
 		retval = mt7628_pracc_force_ir(ejtag_info, EJTAG_INST_FASTDATA);
 		if (retval != ERROR_OK)
@@ -1660,21 +1629,16 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 
 	if (quirk) {
 		/*
-		 * Measured: after the payload the handler is not yet back at
-		 * PRACC_TEXT.  Three more reads are pending at FASTDATA_AREA,
-		 * and until they are consumed the next PRACC entry prime wedges:
+		 * The handler is not back at PRACC_TEXT yet: three more reads
+		 * are pending at FASTDATA_AREA, and until they are consumed the
+		 * next PRACC entry prime wedges. The loop runs exactly count
+		 * iterations, so count+2 scans is arithmetically right - these
+		 * three are the same transaction-accounting artifact as the
+		 * PRACC interlock.
 		 *
-		 *   entry encountered unexpected request: addr=0xff200000
-		 *
-		 * The handler loop runs exactly count iterations, so count+2
-		 * FASTDATA scans is arithmetically right - these three are a
-		 * transaction-accounting artifact of this part, the same family
-		 * as the PRACC interlock, not a miscount.
-		 *
-		 * Draining them with zero-valued ALL scans does not corrupt
-		 * memory: a sentinel in the four words past the region is
-		 * byte-identical before and after a transfer, so the core
-		 * discards these prefetched reads rather than storing them.
+		 * Draining them with zero scans does not corrupt memory: a
+		 * sentinel in the words past the region is byte-identical
+		 * before and after, so the core discards these prefetches.
 		 */
 		retval = mt7628_pracc_force_all_ir(ejtag_info);
 		if (retval != ERROR_OK)

@@ -204,35 +204,22 @@ struct mips_ejtag {
 
 	/*
 	 * Opt-in workaround for EJTAG TAPs whose standalone CONTROL / ADDRESS /
-	 * DATA registers corrupt TAP state when selected individually in Debug
-	 * Mode (observed on MT7628AN).  Off by default: it changes every
-	 * halted-mode transaction and disables FASTDATA, so it must never be
-	 * enabled implicitly.  Set with "mips32 ejtag_all_quirk on".
+	 * DATA registers do not read correctly in Debug Mode (observed on
+	 * MT7628AN).  This is the single switch between the two supported code
+	 * paths; there are no sub-options, because no combination of them was
+	 * ever useful:
+	 *
+	 *   off  stock OpenOCD, unchanged.  Correct on this part when SRST is
+	 *        wired and the debugger enters at the reset vector.
+	 *   on   halted-mode access routed through the 96-bit ALL register, the
+	 *        instruction register re-selected on every access rather than
+	 *        trusting tap->cur_instr, and FASTDATA driven through the
+	 *        ALL-register handshake.  For TRST-only boards.
+	 *
+	 * Off by default: it changes every halted-mode transaction, so it must
+	 * never engage implicitly.  Set with "mips32 ejtag_all_quirk on".
 	 */
 	bool all_quirk;
-
-	/*
-	 * IR-select resynchronisation, for TAPs that do not stay on the
-	 * instruction OpenOCD last selected.  mips_ejtag_set_instr() normally
-	 * skips the IR scan when tap->cur_instr already matches; if the TAP has
-	 * meanwhile reverted, every later DR scan then reads the wrong register.
-	 *
-	 *   0  stock - trust tap->cur_instr
-	 *   1  always emit the IR scan
-	 *   2  always emit it and flush it as its own adapter transaction
-	 *
-	 * Set with "mips32 ejtag_ir_resync".
-	 */
-	unsigned int ir_resync;
-
-	/*
-	 * FASTDATA under all_quirk, using the ALL-register handshake in
-	 * mt7628_fastdata_enter_handler().  Enabled by default - measured at
-	 * ~73 KiB/s against ~2 KiB/s for the PRACC fallback, verified clean.
-	 * Kept as an escape hatch: "mips32 ejtag_allow_fastdata off" falls back
-	 * to PRACC writes.
-	 */
-	bool allow_fastdata;
 	uint32_t pa_ctrl;
 	uint32_t pa_addr;
 	unsigned int ejtag_version;
@@ -266,9 +253,6 @@ int mips64_ejtag_exit_debug(struct mips_ejtag *ejtag_info);
 int mips_ejtag_get_idcode(struct mips_ejtag *ejtag_info);
 void mips_ejtag_add_scan_96(struct mips_ejtag *ejtag_info,
 			    uint32_t ctrl, uint32_t data, uint8_t *in_scan_buf);
-int mips_ejtag_drscan_96(struct mips_ejtag *ejtag_info,
-			    uint32_t ctrl_out, uint32_t data_out,
-			    uint32_t *ctrl_in, uint32_t *data_in, uint32_t *addr_in);
 bool mips_ejtag_control_all_quirk(struct mips_ejtag *ejtag_info);
 int mips_ejtag_drscan_64(struct mips_ejtag *ejtag_info, uint64_t *data);
 void mips_ejtag_drscan_32_out(struct mips_ejtag *ejtag_info, uint32_t data);

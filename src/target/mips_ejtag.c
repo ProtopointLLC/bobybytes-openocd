@@ -13,22 +13,13 @@
 #include "config.h"
 #endif
 
-#include <jtag/adapter.h>
-
 #include "mips32.h"
 #include "mips_ejtag.h"
 #include "mips32_dmaacc.h"
 #include "mips64.h"
 #include "mips64_pracc.h"
 
-
-/*
- * MT7628AN quirk: standalone 32-bit EJTAG CONTROL/ADDRESS/DATA scans can
- * return corrupted-looking values once Debug Mode has been entered, while
- * the combined 96-bit EJTAG ALL scan remains coherent. Identify affected
- * hardware via the EJTAG IDCODE so every other MIPS target keeps using the
- * standalone scans unchanged.
- */
+/* True while the MT7628 workaround is active; see struct mips_ejtag. */
 bool mips_ejtag_control_all_quirk(struct mips_ejtag *ejtag_info)
 {
 	return ejtag_info->all_quirk;
@@ -39,7 +30,14 @@ void mips_ejtag_set_instr(struct mips_ejtag *ejtag_info, uint32_t new_instr)
 	assert(ejtag_info->tap);
 	struct jtag_tap *tap = ejtag_info->tap;
 
-	if (ejtag_info->ir_resync == 0 &&
+	/*
+	 * With the quirk on, never trust tap->cur_instr: this TAP does not
+	 * reliably stay on the last selected instruction, and a skipped select
+	 * leaves OpenOCD scanning whatever register the TAP actually holds.
+	 * Measured symptom: reads of 0xffff824f from what was believed to be
+	 * EJTAG CONTROL - the low half is IDCODE[15:0] for this part.
+	 */
+	if (!mips_ejtag_control_all_quirk(ejtag_info) &&
 			buf_get_u32(tap->cur_instr, 0, tap->ir_length) == new_instr)
 		return;
 
@@ -53,16 +51,6 @@ void mips_ejtag_set_instr(struct mips_ejtag *ejtag_info, uint32_t new_instr)
 	field.in_value = NULL;
 
 	jtag_add_ir_scan(tap, &field, TAP_IDLE);
-
-	/*
-	 * Level 2 additionally flushes the select on its own, so the IR scan
-	 * and the DR scan that follows are separate adapter transactions.
-	 */
-	if (ejtag_info->ir_resync >= 2) {
-		int retval = jtag_execute_queue();
-		if (retval != ERROR_OK)
-			LOG_ERROR("IR resync flush failed");
-	}
 }
 
 int mips_ejtag_get_idcode(struct mips_ejtag *ejtag_info)
@@ -92,88 +80,16 @@ void mips_ejtag_add_scan_96(struct mips_ejtag *ejtag_info, uint32_t ctrl, uint32
 	/* processor access "all" register 96 bit */
 	field.num_bits = 96;
 
-	if (mips_ejtag_control_all_quirk(ejtag_info)) {
-		/*
-		 * Match jim_command_drscan() exactly for MT7628: use one
-		 * buffer for both TDI and TDO.  The interactive Tcl path is
-		 * the known-good reference for this target/J-Link pair.
-		 *
-		 * The caller consumes this buffer only after the scan has
-		 * executed, so overwriting the outgoing contents with the
-		 * captured response is intentional.
-		 */
-		buf_set_u32(in_scan_buf, 0, 32, ctrl);
-		buf_set_u32(in_scan_buf + 4, 0, 32, data);
-		buf_set_u32(in_scan_buf + 8, 0, 32, 0);
-		field.out_value = in_scan_buf;
-		field.in_value = in_scan_buf;
-	} else {
-		field.out_value = out_scan;
-		buf_set_u32(out_scan, 0, 32, ctrl);
-		buf_set_u32(out_scan + 4, 0, 32, data);
-		buf_set_u32(out_scan + 8, 0, 32, 0);
-		field.in_value = in_scan_buf;
-	}
+	field.out_value = out_scan;
+	buf_set_u32(out_scan, 0, 32, ctrl);
+	buf_set_u32(out_scan + 4, 0, 32, data);
+	buf_set_u32(out_scan + 8, 0, 32, 0);
+
+	field.in_value = in_scan_buf;
 
 	jtag_add_dr_scan(tap, 1, &field, TAP_IDLE);
 
 	keep_alive();
-}
-
-int mips_ejtag_drscan_96(struct mips_ejtag *ejtag_info,
-		uint32_t ctrl_out, uint32_t data_out,
-		uint32_t *ctrl_in, uint32_t *data_in, uint32_t *addr_in)
-{
-	uint8_t in_scan[12];
-
-	/*
-	 * Flush the IR scan that selects EJTAG ALL as its own transaction
-	 * before queuing the 96-bit DR scan. The known-good manual recovery
-	 * recipe for this quirk issues "irscan ... 0x0b" and "drscan ... 96 0"
-	 * as two separate interactive commands, each its own round trip to
-	 * the adapter; batching the IR-select and DR-scan into a single
-	 * jtag_execute_queue() call (as mips_ejtag_drscan_32() does for the
-	 * other EJTAG registers) reproduces the same corrupted readback as
-	 * the standalone CONTROL scan this function exists to replace.
-	 */
-	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_ALL);
-	int retval = jtag_execute_queue();
-	if (retval != ERROR_OK) {
-		LOG_ERROR("EJTAG ALL instruction select failed");
-		return retval;
-	}
-
-	/*
-	 * Give the target time to settle onto the ALL shift register before
-	 * it is sampled. Every other EJTAG ALL consumer in this codebase
-	 * (the fast queued PRACC engine in mips32_pracc.c) inserts the same
-	 * scan_delay-derived idle clocks ahead of each 96-bit scan.
-	 */
-	unsigned num_clocks =
-		((uint64_t)(ejtag_info->scan_delay) * adapter_get_speed_khz() + 500000) / 1000000;
-	if (num_clocks)
-		jtag_add_clocks(num_clocks);
-
-	mips_ejtag_add_scan_96(ejtag_info, ctrl_out, data_out, in_scan);
-
-	retval = jtag_execute_queue();
-	if (retval != ERROR_OK) {
-		LOG_ERROR("EJTAG ALL register read failed");
-		return retval;
-	}
-
-	if (ctrl_in)
-		*ctrl_in = buf_get_u32(in_scan, 0, 32);
-	if (data_in)
-		*data_in = buf_get_u32(in_scan + 4, 0, 32);
-	if (addr_in)
-		*addr_in = buf_get_u32(in_scan + 8, 0, 32);
-
-	LOG_DEBUG("EJTAG ALL: ctrl=0x%8.8" PRIx32 " data=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32,
-			buf_get_u32(in_scan, 0, 32), buf_get_u32(in_scan + 4, 0, 32),
-			buf_get_u32(in_scan + 8, 0, 32));
-
-	return ERROR_OK;
 }
 
 int mips_ejtag_drscan_64(struct mips_ejtag *ejtag_info, uint64_t *data)
@@ -372,10 +288,6 @@ int mips_ejtag_enter_debug(struct mips_ejtag *ejtag_info)
 			goto error;
 	}
 
-	LOG_DEBUG("mt7628 all-quirk: %s (tap idcode: 0x%8.8" PRIx32 ")",
-			all_quirk ? "active" : "inactive",
-			ejtag_info->tap ? ejtag_info->tap->idcode : 0);
-
 	/* set debug break bit */
 	ejtag_ctrl = ejtag_info->ejtag_ctrl | EJTAG_CTRL_JTAGBRK;
 	if (all_quirk)
@@ -388,10 +300,12 @@ int mips_ejtag_enter_debug(struct mips_ejtag *ejtag_info)
 
 	/* break bit will be cleared by hardware */
 	ejtag_ctrl = ejtag_info->ejtag_ctrl;
-	if (all_quirk) {
-		LOG_DEBUG("mt7628 all-quirk: skipping post-JTAGBRK CONTROL/ALL read");
+	/*
+	 * Skip the confirming read with the quirk on: it would consume the
+	 * first pending processor access, which the PRACC engine needs.
+	 */
+	if (all_quirk)
 		return ERROR_OK;
-	}
 
 	retval = mips_ejtag_drscan_32(ejtag_info, &ejtag_ctrl);
 	if (retval != ERROR_OK)
