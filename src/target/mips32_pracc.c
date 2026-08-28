@@ -1511,6 +1511,57 @@ static int mips32_fastdata_enter_handler(struct mips_ejtag *ejtag_info,
 	return ERROR_OK;
 }
 
+/*
+ * Wait for the handler's next FASTDATA read without servicing it.
+ *
+ * The stock path uses wait_for_pracc_rw(), which polls EJTAG CONTROL as an
+ * individually selected register - the exact access this part corrupts.  The
+ * ALL register answers the same question: PrAcc written as 1 leaves a pending
+ * access alone, so this observes without consuming.
+ *
+ * Also flushes the queued FASTDATA scan first.  An IR select batched into the
+ * same adapter transaction as a DR scan is what the quirk exists to avoid, so
+ * the data scans and the register selects must not share a queue.
+ *
+ * Leaves the IR forced back onto FASTDATA, ready for the next data scan.
+ */
+static int mt7628_fastdata_wait(struct mips_ejtag *ejtag_info)
+{
+	int retval = jtag_execute_queue();
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = mt7628_pracc_force_all_ir(ejtag_info);
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint32_t observe_ctrl =
+			(ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC) | EJTAG_CTRL_PRACC;
+	int64_t then = timeval_ms();
+
+	while (1) {
+		uint32_t ctrl = 0, daddr = 0;
+
+		retval = mt7628_pracc_all_scan(ejtag_info, observe_ctrl, 0,
+				&ctrl, NULL, &daddr);
+		if (retval != ERROR_OK)
+			return retval;
+
+		if ((ctrl & EJTAG_CTRL_PRACC) &&
+				daddr == MIPS32_PRACC_FASTDATA_AREA)
+			break;
+
+		if (timeval_ms() - then > 1000) {
+			LOG_ERROR("mt7628 fastdata: no access pending at FASTDATA_AREA "
+					"(ctrl=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32 ")",
+					ctrl, daddr);
+			return ERROR_JTAG_DEVICE_ERROR;
+		}
+	}
+
+	return mt7628_pracc_force_ir(ejtag_info, EJTAG_INST_FASTDATA);
+}
+
 int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_area *source,
 		int write_t, uint32_t addr, int count, uint32_t *buf)
 {
@@ -1584,13 +1635,8 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 		return retval;
 
 	if (quirk) {
-		/*
-		 * Select FASTDATA the same way as everything else here: forced
-		 * through BYPASS, flushed on its own. Unlike the stock path
-		 * there is no confirming read that the handler reached
-		 * FASTDATA_AREA - an ALL scan would consume the access it is
-		 * checking for. The FASTDATA scans below service it.
-		 */
+		/* Forced through BYPASS and flushed on its own, like every
+		 * other register select on this part. */
 		retval = mt7628_pracc_force_ir(ejtag_info, EJTAG_INST_FASTDATA);
 		if (retval != ERROR_OK)
 			return retval;
@@ -1598,19 +1644,28 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 
 	/* Send the load start address */
 	uint32_t val = addr;
-	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_FASTDATA);
+	if (!quirk)
+		mips_ejtag_set_instr(ejtag_info, EJTAG_INST_FASTDATA);
 	mips_ejtag_fastdata_scan(ejtag_info, 1, &val);
 
-	if (!quirk) {
+	if (quirk)
+		retval = mt7628_fastdata_wait(ejtag_info);
+	else
 		retval = wait_for_pracc_rw(ejtag_info);
-		if (retval != ERROR_OK)
-			return retval;
-	}
+	if (retval != ERROR_OK)
+		return retval;
 
 	/* Send the load end address */
 	val = addr + (count - 1) * 4;
-	mips_ejtag_set_instr(ejtag_info, EJTAG_INST_FASTDATA);
+	if (!quirk)
+		mips_ejtag_set_instr(ejtag_info, EJTAG_INST_FASTDATA);
 	mips_ejtag_fastdata_scan(ejtag_info, 1, &val);
+
+	if (quirk) {
+		retval = mt7628_fastdata_wait(ejtag_info);
+		if (retval != ERROR_OK)
+			return retval;
+	}
 
 	unsigned num_clocks = 0;	/* like in legacy code */
 	if (ejtag_info->mode != 0)
@@ -1629,40 +1684,40 @@ int mips32_pracc_fastdata_xfer(struct mips_ejtag *ejtag_info, struct working_are
 
 	if (quirk) {
 		/*
-		 * The handler is not back at PRACC_TEXT yet: three more reads
-		 * are pending at FASTDATA_AREA, and until they are consumed the
-		 * next PRACC entry prime wedges. The loop runs exactly count
-		 * iterations, so count+2 scans is arithmetically right - these
-		 * three are the same transaction-accounting artifact as the
-		 * PRACC interlock.
+		 * count + 2 scans is exactly what the handler asks for: two
+		 * address reads and one per word. If it consumed them all it is
+		 * back at PRACC_TEXT with the entry fetch pending, which is the
+		 * state the next PRACC prime expects.
 		 *
-		 * Draining them with zero scans does not corrupt memory: a
-		 * sentinel in the words past the region is byte-identical
-		 * before and after, so the core discards these prefetches.
+		 * Observe without servicing (PrAcc written as 1). A FASTDATA
+		 * read still pending here means the handler stalled mid
+		 * transfer; servicing it would hand the core a zero to store
+		 * into the destination, so fail instead of corrupting memory.
 		 */
+		uint32_t observe_ctrl =
+				(ejtag_info->ejtag_ctrl & ~EJTAG_CTRL_ROCC) | EJTAG_CTRL_PRACC;
+		uint32_t ctrl = 0, daddr = 0;
+
 		retval = mt7628_pracc_force_all_ir(ejtag_info);
 		if (retval != ERROR_OK)
 			return retval;
 
-		for (unsigned int i = 0; i < 8; i++) {
-			uint32_t ctrl = 0, data = 0, daddr = 0;
+		retval = mt7628_pracc_all_scan(ejtag_info, observe_ctrl, 0,
+				&ctrl, NULL, &daddr);
+		if (retval != ERROR_OK)
+			return retval;
 
-			retval = mt7628_pracc_all_scan(ejtag_info, 0, 0,
-					&ctrl, &data, &daddr);
-			if (retval != ERROR_OK)
-				return retval;
+		LOG_DEBUG("mt7628 fastdata: post-transfer ctrl=0x%8.8" PRIx32
+				" addr=0x%8.8" PRIx32, ctrl, daddr);
 
-			LOG_DEBUG("mt7628 fastdata drain[%u]: ctrl=0x%8.8" PRIx32
-					" addr=0x%8.8" PRIx32, i, ctrl, daddr);
-
-			if ((ctrl & EJTAG_CTRL_PRACC) && daddr == MIPS32_PRACC_TEXT) {
-				LOG_DEBUG("mt7628 fastdata: handler retired after %u drain scan(s)", i);
-				return ERROR_OK;
-			}
+		if (!(ctrl & EJTAG_CTRL_PRACC) || daddr != MIPS32_PRACC_TEXT) {
+			LOG_ERROR("mt7628 fastdata: handler did not retire to PRACC_TEXT "
+					"(ctrl=0x%8.8" PRIx32 " addr=0x%8.8" PRIx32
+					"); transfer incomplete", ctrl, daddr);
+			return ERROR_FAIL;
 		}
 
-		LOG_ERROR("mt7628 fastdata: handler did not return to PRACC_TEXT");
-		return ERROR_FAIL;
+		return ERROR_OK;
 	}
 
 	retval = mips32_pracc_read_ctrl_addr(ejtag_info);
