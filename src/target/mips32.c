@@ -1016,8 +1016,9 @@ COMMAND_HANDLER(mips32_handle_ejtag_all_quirk_command)
 	command_print(CMD, "ejtag all-register quirk: %s",
 			ejtag_info->all_quirk ? "on" : "off");
 	if (ejtag_info->all_quirk)
-		command_print(CMD, "  halted-mode access and FASTDATA via the 96-bit "
-				"ALL register; IR re-selected on every access");
+		command_print(CMD, "  halted-mode access through the 96-bit ALL "
+				"register; IR re-selected on every access; "
+				"FASTDATA refused, bulk writes go via PRACC");
 
 	return ERROR_OK;
 }
@@ -1044,9 +1045,10 @@ static const struct command_registration mips32_exec_command_handlers[] = {
 		.help = "Route halted-mode EJTAG access through the 96-bit ALL "
 			"register, for TAPs whose standalone CONTROL/ADDRESS/DATA "
 			"registers do not read correctly in Debug Mode (MT7628AN). "
-			"Also re-selects the instruction register on every access and "
-			"drives FASTDATA through the ALL-register handshake. Off by "
-			"default; off is exactly stock behaviour.",
+			"Also re-selects the instruction register on every access, and "
+			"refuses FASTDATA because that register does not service "
+			"processor accesses on this part, so bulk writes fall back to "
+			"PRACC. Off by default; off is exactly stock behaviour.",
 		.usage = "['on'|'off']",
 	},
 	COMMAND_REGISTRATION_DONE

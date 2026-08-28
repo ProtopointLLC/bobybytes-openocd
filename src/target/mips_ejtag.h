@@ -213,8 +213,8 @@ struct mips_ejtag {
 	 *        wired and the debugger enters at the reset vector.
 	 *   on   halted-mode access routed through the 96-bit ALL register, the
 	 *        instruction register re-selected on every access rather than
-	 *        trusting tap->cur_instr, and FASTDATA driven through the
-	 *        ALL-register handshake.  For TRST-only boards.
+	 *        trusting tap->cur_instr, and FASTDATA refused so that bulk
+	 *        writes fall back to PRACC.  For TRST-only boards.
 	 *
 	 * Off by default: it changes every halted-mode transaction, so it must
 	 * never engage implicitly.  Set with "mips32 ejtag_all_quirk on".
