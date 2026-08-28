@@ -1192,6 +1192,18 @@ static int mips32_pracc_write_mem_generic(struct mips_ejtag *ejtag_info,
 	const uint16_t *buf16 = buf;
 	const uint8_t *buf8 = buf;
 
+	/*
+	 * PRACC writes run at a few KiB/s, so a large load_image is minutes of
+	 * silence.  Report progress on a timer rather than per round: the round
+	 * is 128 words, which is far too fine to report on, and a time-based
+	 * cadence stays readable whatever the adapter speed.  Small writes -
+	 * register restores, mww - stay quiet.
+	 */
+	const int total = count;
+	const bool report = (int64_t)total * size >= MIPS32_PRACC_PROGRESS_MIN_BYTES;
+	const int64_t started = timeval_ms();
+	int64_t next_report = started + MIPS32_PRACC_PROGRESS_INTERVAL_MS;
+
 	while (count) {
 		ctx.code_count = 0;
 		ctx.store_count = 0;
@@ -1235,6 +1247,22 @@ static int mips32_pracc_write_mem_generic(struct mips_ejtag *ejtag_info,
 		if (ctx.retval != ERROR_OK)
 			goto exit;
 		count -= this_round_count;
+
+		if (report) {
+			int64_t now = timeval_ms();
+
+			if (now >= next_report || count == 0) {
+				int64_t done = (int64_t)(total - count) * size;
+				int64_t elapsed = now - started;
+				unsigned int pct = (unsigned int)((total - count) * 100LL / total);
+
+				LOG_INFO("PRACC write: %u%% (%" PRId64 "/%" PRId64 " KiB) at %.3f KiB/s",
+						pct, done / 1024, (int64_t)total * size / 1024,
+						elapsed > 0 ? (double)done / 1.024 / (double)elapsed : 0.0);
+
+				next_report = now + MIPS32_PRACC_PROGRESS_INTERVAL_MS;
+			}
+		}
 	}
 exit:
 	pracc_queue_free(&ctx);
